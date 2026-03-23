@@ -45,7 +45,10 @@ from PyQt6.QtWidgets import (
 # Audio / model constants
 # ---------------------------------------------------------------------------
 SR = 24_000
-CHUNK = 1_920          # 80 ms at 24 kHz
+CHUNK = 1_920          # 80 ms at 24 kHz — model frame size
+SD_BLOCK = 480         # PortAudio blocksize (20 ms); CHUNK must be a multiple
+assert CHUNK % SD_BLOCK == 0
+FORWARD_PAD_MS = 40.0  # pad every forward pass to this duration (ms)
 
 MODELS = [
     {
@@ -192,7 +195,6 @@ class AudioThread(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
-        last_model_avg_ms = [28.0]
         frame_times: collections.deque[float] = collections.deque(maxlen=25)
         frame_count = 0
 
@@ -201,23 +203,22 @@ class AudioThread(threading.Thread):
                 samplerate=SR,
                 channels=1,
                 dtype="float32",
-                blocksize=CHUNK,
+                blocksize=SD_BLOCK,
+                latency="low",
                 device=(self._input_device, self._output_device),
             ) as stream:
-                # Expose device latencies to the UI (available once stream is open)
-                self._perf["input_latency_ms"] = stream.latency[0] * 1000
-                self._perf["output_latency_ms"] = stream.latency[1] * 1000
-
                 while not self.stop_event.is_set():
-                    pcm_in, overflowed = stream.read(CHUNK)
-                    if overflowed:
-                        print("Warning: input overflow", flush=True)
+                    pcm_in = np.empty((CHUNK, 1), dtype=np.float32)
+                    for i in range(CHUNK // SD_BLOCK):
+                        block, overflowed = stream.read(SD_BLOCK)
+                        if overflowed:
+                            print("Warning: input overflow", flush=True)
+                        pcm_in[i * SD_BLOCK:(i + 1) * SD_BLOCK] = block
 
                     with self._lock:
                         cur = self._active[0]
                         t0 = time.perf_counter()
                         if cur == PASSTHROUGH:
-                            time.sleep(last_model_avg_ms[0] / 1000)
                             out = np.clip(pcm_in, -1.0, 1.0)
                         else:
                             x = torch.from_numpy(pcm_in.T[np.newaxis]).to(_DEVICE)
@@ -229,16 +230,18 @@ class AudioThread(threading.Thread):
                             )[:, None]
                         elapsed = (time.perf_counter() - t0) * 1000
 
+                    # Pad to constant FORWARD_PAD_MS so output buffer refill cadence
+                    # is deterministic — safe to use with latency='low'.
+                    remaining = FORWARD_PAD_MS / 1000 - (time.perf_counter() - t0)
+                    if remaining > 0:
+                        time.sleep(remaining)
+
                     # Push model output to spectrogram thread
                     try:
                         self._audio_q.put_nowait(out[:, 0].copy())
                     except queue.Full:
                         pass
 
-                    if cur != PASSTHROUGH:
-                        last_model_avg_ms[0] = (
-                            last_model_avg_ms[0] * 0.98 + elapsed * 0.02
-                        )
                     frame_times.append(elapsed)
                     frame_count += 1
 
@@ -491,16 +494,13 @@ class MainWindow(QMainWindow):
         if avg > 0:
             self._lbl_fwd.setText(f"Forward: {avg:.1f} ms/frame")
             buf_ms = CHUNK / SR * 1000  # 80 ms
-            total = buf_ms + avg + buf_ms
+            out_wait_ms = SD_BLOCK / SR * 1000  # ~20 ms
+            total = buf_ms + FORWARD_PAD_MS + out_wait_ms
             label = (
                 f"E2E ≈  in buf {buf_ms:.0f} ms  +  "
-                f"forward {avg:.0f} ms  +  "
-                f"out buf {buf_ms:.0f} ms  =  {total:.0f} ms"
+                f"forward {avg:.0f} ms (padded to {FORWARD_PAD_MS:.0f})  +  "
+                f"out wait ~{out_wait_ms:.0f} ms  =  {total:.0f} ms"
             )
-            in_dev = self._perf.get("input_latency_ms")
-            out_dev = self._perf.get("output_latency_ms")
-            if in_dev is not None:
-                label += f"   [PortAudio buf: in {in_dev:.0f} ms / out {out_dev:.0f} ms]"
             self._lbl_latency.setText(label)
 
     # ------------------------------------------------------------------
@@ -565,7 +565,13 @@ def main():
     parser = argparse.ArgumentParser(description="Mimi real-time demo (PyQt6 GUI)")
     parser.add_argument("--input-device", type=int, default=None)
     parser.add_argument("--output-device", type=int, default=None)
+    parser.add_argument("--block-size", type=int, default=480,
+                        help="PortAudio blocksize in samples (default 480 = 20ms)")
     args = parser.parse_args()
+
+    global SD_BLOCK
+    SD_BLOCK = args.block_size
+    assert CHUNK % SD_BLOCK == 0, f"CHUNK ({CHUNK}) must be a multiple of --block-size ({SD_BLOCK})"
 
     app = QApplication([])
     app.setApplicationName("Mimi Streaming Demo")
