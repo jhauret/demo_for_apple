@@ -279,7 +279,7 @@ class MainWindow(QMainWindow):
         # Will be populated by _load_models()
         self._mimi: list = []
 
-        self.setWindowTitle("Mimi Streaming Demo")
+        self.setWindowTitle("Real-Time Throat Mic Enhancement")
         self.resize(780, 600)
 
         self._build_ui()
@@ -298,7 +298,7 @@ class MainWindow(QMainWindow):
 
         # --- Top bar: title + Enhance toggle + Start/Stop ---
         top = QHBoxLayout()
-        title = QLabel("<b>Mimi Streaming Demo</b>")
+        title = QLabel("<b>Real-Time Throat Mic Enhancement</b>")
         title.setStyleSheet("font-size: 16px;")
         top.addWidget(title)
         top.addStretch()
@@ -574,7 +574,7 @@ def main():
     assert CHUNK % SD_BLOCK == 0, f"CHUNK ({CHUNK}) must be a multiple of --block-size ({SD_BLOCK})"
 
     app = QApplication([])
-    app.setApplicationName("Mimi Streaming Demo")
+    app.setApplicationName("Real-Time Throat Mic Enhancement")
 
     win = MainWindow(
         input_device=args.input_device,
