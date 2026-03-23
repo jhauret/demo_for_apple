@@ -32,6 +32,7 @@ from moshi.models import loaders
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -333,6 +334,24 @@ class MainWindow(QMainWindow):
         top.addWidget(self._btn_start)
         root.addLayout(top)
 
+        # --- Input device selector ---
+        device_row = QHBoxLayout()
+        device_row.addWidget(QLabel("Input device:"))
+        self._combo_input = QComboBox()
+        self._input_device_ids = []
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_input_channels"] > 0:
+                self._combo_input.addItem(f"{dev['name']}", userData=i)
+                self._input_device_ids.append(i)
+                if i == self._input_device or (
+                    self._input_device is None and dev.get("default_samplerate")
+                    and sd.query_devices(kind="input")["name"] == dev["name"]
+                ):
+                    self._combo_input.setCurrentIndex(self._combo_input.count() - 1)
+        self._combo_input.currentIndexChanged.connect(self._on_input_device_changed)
+        device_row.addWidget(self._combo_input, stretch=1)
+        root.addLayout(device_row)
+
         # --- Matplotlib spectrogram ---
         self._fig = Figure(figsize=(7, 4), tight_layout=True)
         self._canvas = FigureCanvas(self._fig)
@@ -505,6 +524,12 @@ class MainWindow(QMainWindow):
     def _on_latency_slider(self, value: int):
         self._extra_latency_ms[0] = value
         self._lbl_extra.setText(f"{value} ms" if value < 1000 else f"{value/1000:.1f} s")
+
+    def _on_input_device_changed(self, index: int):
+        self._input_device = self._combo_input.itemData(index)
+        if self._audio_thread is not None:
+            self._stop_stream()
+            self._start_stream()
 
     # ------------------------------------------------------------------
     # Plot update (called by QTimer every 40 ms)
