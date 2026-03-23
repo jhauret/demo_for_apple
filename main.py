@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QProgressDialog,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -181,6 +182,7 @@ class AudioThread(threading.Thread):
         active: list,
         model_lock: threading.Lock,
         perf: dict,
+        extra_latency_ms: list,
         input_device=None,
         output_device=None,
     ):
@@ -190,12 +192,15 @@ class AudioThread(threading.Thread):
         self._active = active
         self._lock = model_lock
         self._perf = perf
+        self._extra_latency_ms = extra_latency_ms
         self._input_device = input_device
         self._output_device = output_device
         self.stop_event = threading.Event()
 
     def run(self):
+        CHUNK_MS = CHUNK / SR * 1000  # 80.0 ms
         frame_times: collections.deque[float] = collections.deque(maxlen=25)
+        output_deque: collections.deque = collections.deque()
         frame_count = 0
 
         try:
@@ -249,7 +254,17 @@ class AudioThread(threading.Thread):
                     if frame_count % 25 == 0:
                         self._perf["avg_ms"] = sum(frame_times) / len(frame_times)
 
-                    stream.write(out)
+                    # Extra-latency deque: buffer `n_buffered` chunks before playing.
+                    output_deque.append(out)
+                    n_buffered = round(self._extra_latency_ms[0] / CHUNK_MS)
+                    # Trim excess chunks when slider was reduced (causes brief silence).
+                    while len(output_deque) > n_buffered + 1:
+                        output_deque.popleft()
+                    if len(output_deque) > n_buffered:
+                        to_play = output_deque.popleft()
+                    else:
+                        to_play = np.zeros((CHUNK, 1), dtype=np.float32)
+                    stream.write(to_play)
 
         except Exception as exc:
             print(f"AudioThread error: {exc}", flush=True)
@@ -268,6 +283,7 @@ class MainWindow(QMainWindow):
         self._active = [PASSTHROUGH]
         self._model_lock = threading.Lock()
         self._perf: dict = {"avg_ms": 0.0}
+        self._extra_latency_ms: list = [0]
         self._audio_queue: queue.Queue = queue.Queue(maxsize=8)
         self._spec_queue: queue.Queue = queue.Queue(maxsize=32)
         self._audio_thread: AudioThread | None = None
@@ -339,6 +355,22 @@ class MainWindow(QMainWindow):
         ax.set_ylim(0, SR / 2 / 1000)
 
         root.addWidget(self._canvas)
+
+        # --- Additional latency slider ---
+        latency_row = QHBoxLayout()
+        latency_row.addWidget(QLabel("Additional latency:"))
+        self._lbl_extra = QLabel("0 ms")
+        self._lbl_extra.setFixedWidth(60)
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setMinimum(0)
+        self._slider.setMaximum(5000)
+        self._slider.setSingleStep(80)
+        self._slider.setPageStep(500)
+        self._slider.setValue(0)
+        self._slider.valueChanged.connect(self._on_latency_slider)
+        latency_row.addWidget(self._slider)
+        latency_row.addWidget(self._lbl_extra)
+        root.addLayout(latency_row)
 
         # --- Status bar ---
         status_bar = QHBoxLayout()
@@ -426,6 +458,7 @@ class MainWindow(QMainWindow):
             active=self._active,
             model_lock=self._model_lock,
             perf=self._perf,
+            extra_latency_ms=self._extra_latency_ms,
             input_device=self._input_device,
             output_device=self._output_device,
         )
@@ -469,6 +502,10 @@ class MainWindow(QMainWindow):
         """Toggle Enhance on/off (Space key shortcut)."""
         self._select_model(PASSTHROUGH if self._active[0] != PASSTHROUGH else 0)
 
+    def _on_latency_slider(self, value: int):
+        self._extra_latency_ms[0] = value
+        self._lbl_extra.setText(f"{value} ms" if value < 1000 else f"{value/1000:.1f} s")
+
     # ------------------------------------------------------------------
     # Plot update (called by QTimer every 40 ms)
     # ------------------------------------------------------------------
@@ -495,12 +532,16 @@ class MainWindow(QMainWindow):
             self._lbl_fwd.setText(f"Forward: {avg:.1f} ms/frame")
             buf_ms = CHUNK / SR * 1000  # 80 ms
             out_wait_ms = SD_BLOCK / SR * 1000  # ~20 ms
-            total = buf_ms + FORWARD_PAD_MS + out_wait_ms
+            extra_ms = self._extra_latency_ms[0]
+            total = buf_ms + FORWARD_PAD_MS + out_wait_ms + extra_ms
             label = (
                 f"E2E ≈  in buf {buf_ms:.0f} ms  +  "
                 f"forward {avg:.0f} ms (padded to {FORWARD_PAD_MS:.0f})  +  "
-                f"out wait ~{out_wait_ms:.0f} ms  =  {total:.0f} ms"
+                f"out wait ~{out_wait_ms:.0f} ms"
             )
+            if extra_ms > 0:
+                label += f"  +  extra {extra_ms:.0f} ms"
+            label += f"  =  {total:.0f} ms"
             self._lbl_latency.setText(label)
 
     # ------------------------------------------------------------------
